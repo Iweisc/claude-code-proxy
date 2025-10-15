@@ -138,6 +138,54 @@ def clean_gemini_schema(schema: Any) -> Any:
         return [clean_gemini_schema(item) for item in schema]
     return schema
 
+# Parameter name mappings for common variations
+PARAMETER_MAPPINGS = {
+    "read_file": {
+        "file_path": "path",
+        "filepath": "path",
+        "file": "path"
+    },
+    "write_to_file": {
+        "file_path": "path",
+        "filepath": "path",
+        "file": "path"
+    },
+    "apply_diff": {
+        "file_path": "path",
+        "filepath": "path",
+        "file": "path"
+    }
+}
+
+def normalize_tool_parameters(tool_name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Normalize tool parameters by mapping common parameter name variations.
+    This helps handle clients that use different parameter names than expected.
+    """
+    if tool_name not in PARAMETER_MAPPINGS:
+        return parameters
+    
+    mappings = PARAMETER_MAPPINGS[tool_name]
+    normalized = {}
+    
+    for key, value in parameters.items():
+        # Check if this parameter name should be mapped
+        if key in mappings:
+            normalized_key = mappings[key]
+            logger.debug(f"Normalizing parameter '{key}' -> '{normalized_key}' for tool '{tool_name}'")
+            normalized[normalized_key] = value
+        else:
+            normalized[key] = value
+    
+    # Remove unsupported parameters like offset and limit
+    unsupported_params = ["offset", "limit"]
+    for param in unsupported_params:
+        if param in normalized:
+            logger.debug(f"Removing unsupported parameter '{param}' from tool '{tool_name}'")
+            normalized.pop(param)
+    
+    return normalized
+
 # Models for Anthropic API requests
 class ContentBlockText(BaseModel):
     type: Literal["text"]
@@ -527,12 +575,13 @@ def convert_anthropic_to_litellm(anthropic_request: MessagesRequest) -> Dict[str
                         elif block.type == "image":
                             processed_content.append({"type": "image", "source": block.source})
                         elif block.type == "tool_use":
-                            # Handle tool use blocks if needed
+                            # Normalize tool parameters before adding
+                            normalized_input = normalize_tool_parameters(block.name, block.input)
                             processed_content.append({
                                 "type": "tool_use",
                                 "id": block.id,
                                 "name": block.name,
-                                "input": block.input
+                                "input": normalized_input
                             })
                         elif block.type == "tool_result":
                             # Handle different formats of tool result content
@@ -739,13 +788,16 @@ def convert_litellm_to_anthropic(litellm_response: Union[Dict[str, Any], Any],
                         logger.warning(f"Failed to parse tool arguments as JSON: {arguments}")
                         arguments = {"raw": arguments}
                 
-                logger.debug(f"Adding tool_use block: id={tool_id}, name={name}, input={arguments}")
+                # Normalize the tool parameters
+                normalized_arguments = normalize_tool_parameters(name, arguments)
+                
+                logger.debug(f"Adding tool_use block: id={tool_id}, name={name}, input={normalized_arguments}")
                 
                 content.append({
                     "type": "tool_use",
                     "id": tool_id,
                     "name": name,
-                    "input": arguments
+                    "input": normalized_arguments
                 })
         elif tool_calls and not is_claude_model:
             # For non-Claude models, convert tool calls to text format
@@ -1479,14 +1531,11 @@ async def count_tokens(
             )
             
             # Prepare token counter arguments
+            # Note: token_counter only accepts model and messages parameters
             token_counter_args = {
                 "model": converted_request["model"],
                 "messages": converted_request["messages"],
             }
-            
-            # Add custom base URL for OpenAI models if configured
-            if request.model.startswith("openai/") and OPENAI_BASE_URL:
-                token_counter_args["api_base"] = OPENAI_BASE_URL
             
             # Count tokens
             token_count = token_counter(**token_counter_args)
